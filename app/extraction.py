@@ -1,81 +1,128 @@
 """
-Modul ekstraksi field terstruktur: teks OCR mentah -> 27 field sesuai skema
-Google Sheets, memakai model text-only kedua (qwen2.5:7b) via Ollama dengan
-constrained JSON output (parameter `format` berisi JSON Schema).
+Modul ekstraksi field terstruktur: teks OCR mentah -> 23 field via model
+text-only kedua (qwen2.5:7b, Ollama, constrained JSON output).
+
+ARSITEKTUR DUA-PANGGILAN:
+Field dikelompokkan jadi dua, karena sumber teksnya berbeda:
+
+1. `ADMIN_FIELDS` — field administratif yang selalu ada di 1-2 halaman
+   pertama surat (kop surat & blok tanda tangan): nomor_surat,
+   jenis_kegiatan, provinsi_lokasi, pelaksanaan, tanggal_surat,
+   jabatan_penandatangan, penandatangan.
+   -> diekstrak dari teks OCR halaman 1-2 SAJA (dibatasi via
+      EXTRACTION_MAX_PAGES), supaya tidak "tersesat" ke lampiran.
+
+2. `FULL_DOC_FIELDS` — field yang bisa muncul di mana saja termasuk
+   lampiran: petugas1-4 (nama/nip/no_reg), nama_upi, alamat_upi,
+   jenis_produk_grade, no_reg (nomor registrasi dokumen).
+   -> diekstrak dari teks OCR SELURUH halaman dokumen.
+
+Hasil kedua panggilan digabung (dict merge) sebelum disimpan ke DB.
 """
 import json
 import logging
 
 from ollama import Client
 
-from app.config import EXTRACTION_MODEL_NAME, EXTRACTION_NUM_CTX
+from app.config import EXTRACTION_FULL_NUM_CTX, EXTRACTION_MODEL_NAME, EXTRACTION_NUM_CTX
 
 logger = logging.getLogger(__name__)
 
-# Field yang diekstrak model (TIDAK termasuk: id, document_id,
-# tanggal_diinput [auto], nama_file [dari nama file asli, bukan hasil LLM],
-# drive_file_url/synced/synced_at [diisi Tahap 4]).
 _STR_OR_NULL = {"type": ["string", "null"]}
 
-EXTRACTION_JSON_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "nomor_surat": _STR_OR_NULL,
-        "jenis_kegiatan": _STR_OR_NULL,
-        "provinsi_lokasi": _STR_OR_NULL,
-        "pelaksanaan": _STR_OR_NULL,
-        "tanggal_surat": {
-            **_STR_OR_NULL,
-            "description": "Format YYYY-MM-DD jika bisa ditentukan, null jika tidak jelas.",
-        },
-        "jabatan_penandatangan": _STR_OR_NULL,
-        "penandatangan": _STR_OR_NULL,
-        "petugas1_nama": _STR_OR_NULL,
-        "petugas1_nip": _STR_OR_NULL,
-        "petugas1_no_reg": _STR_OR_NULL,
-        "petugas2_nama": _STR_OR_NULL,
-        "petugas2_nip": _STR_OR_NULL,
-        "petugas2_no_reg": _STR_OR_NULL,
-        "petugas3_nama": _STR_OR_NULL,
-        "petugas3_nip": _STR_OR_NULL,
-        "petugas3_no_reg": _STR_OR_NULL,
-        "petugas4_nama": _STR_OR_NULL,
-        "petugas4_nip": _STR_OR_NULL,
-        "petugas4_no_reg": _STR_OR_NULL,
-        "nama_upi": _STR_OR_NULL,
-        "alamat_upi": _STR_OR_NULL,
-        "jenis_produk_grade": _STR_OR_NULL,
-        "no_reg": {
-            **_STR_OR_NULL,
-            "description": (
-                "Nomor registrasi DOKUMEN secara keseluruhan, "
-                "BUKAN nomor registrasi profesi petugas."
-            ),
-        },
-    },
-    # `required` di JSON Schema Ollama berarti key harus MUNCUL di output
-    # (nilainya tetap boleh null berkat type union di atas) — ini memaksa
-    # model konsisten mengisi semua 22 field, bukan berarti tidak boleh null.
-    "required": [
-        "nomor_surat", "jenis_kegiatan", "provinsi_lokasi", "pelaksanaan",
-        "tanggal_surat", "jabatan_penandatangan", "penandatangan",
-        "petugas1_nama", "petugas1_nip", "petugas1_no_reg",
-        "petugas2_nama", "petugas2_nip", "petugas2_no_reg",
-        "petugas3_nama", "petugas3_nip", "petugas3_no_reg",
-        "petugas4_nama", "petugas4_nip", "petugas4_no_reg",
-        "nama_upi", "alamat_upi", "jenis_produk_grade", "no_reg",
-    ],
+# --- Kelompok 1: field administratif, sumber = halaman 1-2 ---
+ADMIN_FIELDS = [
+    "nomor_surat", "jenis_kegiatan", "provinsi_lokasi", "pelaksanaan",
+    "tanggal_surat", "jabatan_penandatangan", "penandatangan",
+]
+
+# --- Kelompok 2: field lain, sumber = seluruh dokumen (termasuk lampiran) ---
+FULL_DOC_FIELDS = [
+    "petugas1_nama", "petugas1_nip", "petugas1_no_reg",
+    "petugas2_nama", "petugas2_nip", "petugas2_no_reg",
+    "petugas3_nama", "petugas3_nip", "petugas3_no_reg",
+    "petugas4_nama", "petugas4_nip", "petugas4_no_reg",
+    "nama_upi", "alamat_upi", "jenis_produk_grade", "no_reg",
+]
+
+# Deskripsi khusus untuk field tertentu (dipakai di JSON schema)
+_FIELD_DESCRIPTIONS = {
+    "tanggal_surat": "Format YYYY-MM-DD jika bisa ditentukan, null jika tidak jelas.",
+    "no_reg": (
+        "Nomor registrasi DOKUMEN secara keseluruhan, "
+        "BUKAN nomor registrasi profesi petugas."
+    ),
 }
 
-EXTRACTION_SYSTEM_PROMPT = """\
-Anda adalah asisten ekstraksi data dari surat dinas hasil OCR. Baca teks
-surat di bawah dan keluarkan HANYA JSON sesuai skema yang diberikan.
+
+def _build_schema(field_names: list[str]) -> dict:
+    """Bangun JSON Schema (untuk parameter `format` Ollama) yang hanya
+    berisi field_names, semua bertipe string-atau-null."""
+    properties = {}
+    for name in field_names:
+        prop = dict(_STR_OR_NULL)
+        if name in _FIELD_DESCRIPTIONS:
+            prop["description"] = _FIELD_DESCRIPTIONS[name]
+        properties[name] = prop
+    return {
+        "type": "object",
+        "properties": properties,
+        # `required` di sini berarti key harus MUNCUL di output (nilainya
+        # tetap boleh null berkat type union) — bukan berarti wajib terisi.
+        "required": list(field_names),
+    }
+
+
+ADMIN_JSON_SCHEMA = _build_schema(ADMIN_FIELDS)
+FULL_DOC_JSON_SCHEMA = _build_schema(FULL_DOC_FIELDS)
+
+# Untuk kompatibilitas/inspeksi: gabungan skema semua 23 field.
+EXTRACTION_JSON_SCHEMA = _build_schema(ADMIN_FIELDS + FULL_DOC_FIELDS)
+
+
+ADMIN_SYSTEM_PROMPT = """\
+Anda adalah asisten ekstraksi data dari surat dinas hasil OCR. Anda hanya
+diberikan 1-2 halaman PERTAMA surat (kop surat & blok tanda tangan) —
+bagian ini biasanya memuat nomor surat, jenis kegiatan, lokasi, tanggal,
+dan jabatan/nama penandatangan.
+
+ATURAN:
+1. Isi null untuk field apa pun yang TIDAK disebutkan secara eksplisit di
+   teks. JANGAN mengarang nomor, tanggal, atau nama yang tidak ada.
+2. `jabatan_penandatangan` = jabatan/posisi resmi orang yang menandatangani
+   surat (mis. "Kepala UPT"). `penandatangan` = nama orang tersebut.
+   Keduanya biasanya berdampingan di blok tanda tangan akhir surat.
+3. `pelaksanaan` = keterangan waktu/periode pelaksanaan kegiatan
+   (mis. rentang tanggal kegiatan), BUKAN tanggal surat itu sendiri.
+4. `tanggal_surat` SERING TIDAK berlabel "Tanggal:" secara eksplisit.
+   Pola paling umum: baris "<Kota>, <tanggal>" yang berdiri sendiri
+   TEPAT DI ATAS blok jabatan_penandatangan/penandatangan, contoh:
+
+     Surabaya, 24 Juli 2026
+     Kepala UPT
+     [ttd]
+     Ahmad Fauzi
+
+   Di sini tanggal_surat = "2026-07-24" (bukan null), diambil dari baris
+   kota+tanggal itu meski tidak ada kata "Tanggal:". Konversi nama bulan
+   Indonesia (Januari-Desember) ke angka 01-12 untuk format YYYY-MM-DD.
+   Kalau tahun/bulan/tanggal tidak lengkap atau tidak jelas, baru isi null.
+
+Balas HANYA dengan objek JSON sesuai skema, tanpa teks pembuka, penutup,
+atau markdown code fence.
+"""
+
+FULL_DOC_SYSTEM_PROMPT = """\
+Anda adalah asisten ekstraksi data dari surat dinas hasil OCR. Anda
+diberikan teks OCR SELURUH halaman dokumen (surat utama + lampiran, jika
+ada). Field yang diminta di sini bisa muncul di halaman mana pun,
+termasuk lampiran (mis. daftar petugas pelaksana sering ada di lampiran).
 
 ATURAN PENTING:
 1. Isi null untuk field apa pun yang TIDAK disebutkan secara eksplisit di
-   teks. JANGAN mengarang nama, NIP, nomor, atau tanggal yang tidak ada.
+   teks. JANGAN mengarang nama, NIP, atau nomor yang tidak ada.
 2. Petugas 2, 3, dan 4 boleh seluruhnya null jika surat hanya melibatkan
-   1-3 petugas (lihat daftar nama pada bagian penugasan/lampiran surat).
+   1-3 petugas.
 3. Ada DUA jenis "No. Reg" yang BERBEDA — jangan sampai tertukar:
    a. `no_reg` (di level dokumen) = nomor registrasi SURAT/DOKUMEN itu
       sendiri, biasanya muncul di kop surat atau nomor administrasi surat.
@@ -116,8 +163,8 @@ Ekstraksi yang BENAR:
    nama file hanya alat bantu verifikasi, bukan pengganti jika isi surat
    jelas menyebutkan UPI yang berbeda.
 
-Sekarang ekstrak dari teks surat berikut. Balas HANYA dengan objek JSON,
-tanpa teks pembuka, penutup, atau markdown code fence.
+Balas HANYA dengan objek JSON sesuai skema, tanpa teks pembuka, penutup,
+atau markdown code fence.
 """
 
 
@@ -126,28 +173,21 @@ def get_extraction_client() -> Client:
     return Client(host=OLLAMA_HOST)
 
 
-def extract_fields(ocr_text: str, client: Client, file_name: str | None = None) -> dict:
-    """Kirim teks OCR gabungan (+ nama file sebagai konteks referensi
-    silang nama UPI) ke model ekstraksi, kembalikan dict field.
-
-    Melempar ValueError jika model gagal menghasilkan JSON valid sesuai
-    skema (jarang terjadi karena constrained output, tapi tetap dijaga).
-    """
-    user_content = ocr_text
-    if file_name:
-        user_content = (
-            f"[Nama file dokumen (konteks referensi, lihat aturan #4): {file_name}]\n\n"
-            f"{ocr_text}"
-        )
-
+def _call_extraction_model(
+    client: Client,
+    system_prompt: str,
+    user_content: str,
+    json_schema: dict,
+    num_ctx: int,
+) -> dict:
     response = client.chat(
         model=EXTRACTION_MODEL_NAME,
         messages=[
-            {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ],
-        format=EXTRACTION_JSON_SCHEMA,
-        options={"num_ctx": EXTRACTION_NUM_CTX, "temperature": 0},
+        format=json_schema,
+        options={"num_ctx": num_ctx, "temperature": 0},
     )
     raw_content = response["message"]["content"]
     try:
@@ -158,10 +198,38 @@ def extract_fields(ocr_text: str, client: Client, file_name: str | None = None) 
             f"Isi mentah: {raw_content[:500]}"
         ) from exc
 
-    # Validasi ringan: pastikan semua key yang diharapkan ada, isi None
-    # untuk key yang hilang (jaga-jaga meski constrained output seharusnya
-    # sudah menjamin ini).
-    for key in EXTRACTION_JSON_SCHEMA["required"]:
+    for key in json_schema["required"]:
         parsed.setdefault(key, None)
-
     return parsed
+
+
+def extract_fields(
+    admin_text: str,
+    full_text: str,
+    client: Client,
+    file_name: str | None = None,
+) -> dict:
+    """Jalankan dua panggilan model ekstraksi dan gabungkan hasilnya.
+
+    `admin_text`: teks OCR halaman 1-2 (untuk field administratif).
+    `full_text`: teks OCR seluruh halaman (untuk petugas/UPI/no_reg).
+
+    Melempar ValueError jika salah satu panggilan gagal menghasilkan JSON
+    valid sesuai skema.
+    """
+    admin_result = _call_extraction_model(
+        client, ADMIN_SYSTEM_PROMPT, admin_text, ADMIN_JSON_SCHEMA, EXTRACTION_NUM_CTX,
+    )
+
+    full_user_content = full_text
+    if file_name:
+        full_user_content = (
+            f"[Nama file dokumen (konteks referensi, lihat aturan #4): {file_name}]\n\n"
+            f"{full_text}"
+        )
+    full_result = _call_extraction_model(
+        client, FULL_DOC_SYSTEM_PROMPT, full_user_content, FULL_DOC_JSON_SCHEMA,
+        EXTRACTION_FULL_NUM_CTX,
+    )
+
+    return {**admin_result, **full_result}

@@ -6,9 +6,12 @@ Contoh pemakaian:
     python -m app.main_extract --document-id 3  # proses satu dokumen spesifik
                                                   # (retry meski statusnya bukan ocr_done)
 
-Alur per dokumen:
-  1. Ambil gabungan raw_text semua halaman dari `ocr_results`.
-  2. Kirim ke model ekstraksi (qwen2.5:7b via Ollama, constrained JSON).
+Alur per dokumen (lihat app/extraction.py untuk arsitektur dua-panggilan):
+  1. Ambil teks OCR halaman 1-2 (untuk field administratif) DAN teks OCR
+     seluruh halaman (untuk field lain: petugas/UPI/no_reg, termasuk
+     lampiran).
+  2. Kirim keduanya ke model ekstraksi (qwen2.5:7b via Ollama, dua
+     panggilan constrained JSON terpisah) -> hasil digabung jadi 23 field.
   3. Simpan hasil ke tabel `extracted_fields`.
   4. Update status dokumen -> 'extracted', atau 'error' + pesan jika gagal.
 """
@@ -40,9 +43,10 @@ logger = logging.getLogger(__name__)
 def process_document(document_id: int, file_name: str) -> str:
     """Proses ekstraksi satu dokumen. Mengembalikan status akhir."""
     with get_connection() as conn:
-        ocr_text = get_combined_ocr_text(conn, document_id, max_pages=EXTRACTION_MAX_PAGES)
+        admin_text = get_combined_ocr_text(conn, document_id, max_pages=EXTRACTION_MAX_PAGES)
+        full_text = get_combined_ocr_text(conn, document_id, max_pages=None)
 
-    if not ocr_text.strip():
+    if not full_text.strip():
         logger.error("Tidak ada teks OCR untuk document_id=%s, dilewati.", document_id)
         with get_connection() as conn:
             update_document_status(
@@ -51,12 +55,12 @@ def process_document(document_id: int, file_name: str) -> str:
         return "error"
 
     logger.info(
-        "Ekstraksi field: %s (document_id=%s, max_pages=%s)",
+        "Ekstraksi field: %s (document_id=%s, halaman admin<=%s, halaman full=semua)",
         file_name, document_id, EXTRACTION_MAX_PAGES or "semua",
     )
     client = get_extraction_client()
     try:
-        fields = extract_fields(ocr_text, client, file_name=file_name)
+        fields = extract_fields(admin_text, full_text, client, file_name=file_name)
         with get_connection() as conn:
             # Bersihkan hasil ekstraksi lama jika ini retry
             delete_extracted_fields(conn, document_id)
