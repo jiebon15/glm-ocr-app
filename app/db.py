@@ -91,10 +91,23 @@ def get_connection() -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, coltype: str) -> None:
+    """Tambahkan kolom ke tabel jika belum ada (migrasi ringan, aman
+    dipanggil berulang kali, tidak menyentuh data yang sudah ada)."""
+    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+
+
 def init_db() -> None:
-    """Buat semua tabel jika belum ada. Aman dipanggil berulang kali."""
+    """Buat semua tabel jika belum ada, lalu jalankan migrasi ringan.
+    Aman dipanggil berulang kali."""
     with get_connection() as conn:
         conn.executescript(SCHEMA)
+        # Tahap 3 (GUI): perlu tahu lokasi file PDF asli di disk (untuk
+        # retry & upload Drive di Tahap 4). Migrasi non-destruktif -
+        # database lama tanpa kolom ini tetap aman, nilainya NULL.
+        _ensure_column(conn, "documents", "local_path", "TEXT")
 
 
 def find_document_by_hash(conn: sqlite3.Connection, file_hash: str) -> Optional[sqlite3.Row]:
@@ -115,13 +128,18 @@ def reset_document_for_retry(conn: sqlite3.Connection, document_id: int) -> None
     )
 
 
-def insert_document(conn: sqlite3.Connection, file_name: str, file_hash: str) -> int:
+def insert_document(
+    conn: sqlite3.Connection,
+    file_name: str,
+    file_hash: str,
+    local_path: Optional[str] = None,
+) -> int:
     cur = conn.execute(
         """
-        INSERT INTO documents (file_name, file_hash, upload_time, status)
-        VALUES (?, ?, ?, 'pending')
+        INSERT INTO documents (file_name, file_hash, upload_time, status, local_path)
+        VALUES (?, ?, ?, 'pending', ?)
         """,
-        (file_name, file_hash, datetime.now().isoformat()),
+        (file_name, file_hash, datetime.now().isoformat(), local_path),
     )
     return cur.lastrowid
 
@@ -230,3 +248,101 @@ def insert_extracted_fields(
         values,
     )
     return cur.lastrowid
+
+
+def get_status_counts(conn: sqlite3.Connection) -> dict:
+    """Hitung jumlah dokumen per status, untuk ringkasan di GUI."""
+    rows = conn.execute("SELECT status, COUNT(*) AS n FROM documents GROUP BY status").fetchall()
+    return {row["status"]: row["n"] for row in rows}
+
+
+def get_all_documents_overview(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Daftar semua dokumen (untuk tab Ringkasan/Riwayat di GUI)."""
+    return conn.execute(
+        "SELECT id, file_name, status, error_message, upload_time FROM documents ORDER BY id DESC"
+    ).fetchall()
+
+
+def has_ocr_results(conn: sqlite3.Connection, document_id: int) -> bool:
+    cur = conn.execute(
+        "SELECT 1 FROM ocr_results WHERE document_id = ? LIMIT 1", (document_id,)
+    )
+    return cur.fetchone() is not None
+
+
+def get_review_queue(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Dokumen berstatus 'extracted' beserta field hasil ekstraksinya,
+    siap ditampilkan di tabel editable untuk verifikasi manual."""
+    columns = ", ".join(f"ef.{c}" for c in _EXTRACTED_FIELD_COLUMNS)
+    return conn.execute(
+        f"""
+        SELECT d.id AS document_id, d.file_name, {columns}
+        FROM documents d
+        JOIN extracted_fields ef ON ef.document_id = d.id
+        WHERE d.status = 'extracted'
+        ORDER BY d.id
+        """
+    ).fetchall()
+
+
+def update_extracted_fields(conn: sqlite3.Connection, document_id: int, fields: dict) -> None:
+    """Terapkan koreksi manual dari GUI ke tabel extracted_fields.
+    `fields` boleh berisi subset _EXTRACTED_FIELD_COLUMNS; hanya key yang
+    ada yang di-update."""
+    cols_to_update = [c for c in _EXTRACTED_FIELD_COLUMNS if c in fields]
+    if not cols_to_update:
+        return
+    set_clause = ", ".join(f"{c} = ?" for c in cols_to_update)
+    values = [fields[c] for c in cols_to_update] + [document_id]
+    conn.execute(
+        f"UPDATE extracted_fields SET {set_clause} WHERE document_id = ?", values
+    )
+
+
+def mark_reviewed(conn: sqlite3.Connection, document_id: int) -> None:
+    """Tandai dokumen sudah diverifikasi manual (Tahap 3). Sinkronisasi
+    ke Sheets/Drive baru terjadi di Tahap 4."""
+    update_document_status(conn, document_id, "reviewed")
+
+
+def get_extracted_fields_by_document(conn: sqlite3.Connection, document_id: int) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM extracted_fields WHERE document_id = ?", (document_id,)
+    ).fetchone()
+
+
+def update_drive_file_url(conn: sqlite3.Connection, document_id: int, url: str) -> None:
+    conn.execute(
+        "UPDATE extracted_fields SET drive_file_url = ? WHERE document_id = ?",
+        (url, document_id),
+    )
+
+
+def clear_local_path(conn: sqlite3.Connection, document_id: int) -> None:
+    """Kosongkan local_path setelah file PDF asli dihapus (sumber
+    kebenaran berpindah ke Drive, tidak disimpan ganda secara lokal)."""
+    conn.execute("UPDATE documents SET local_path = NULL WHERE id = ?", (document_id,))
+
+
+def mark_synced(conn: sqlite3.Connection, document_id: int) -> None:
+    """Tandai dokumen sudah tersinkron ke Google Sheets."""
+    conn.execute(
+        "UPDATE extracted_fields SET synced = 1, synced_at = ? WHERE document_id = ?",
+        (datetime.now().isoformat(), document_id),
+    )
+    update_document_status(conn, document_id, "synced")
+
+
+def get_unsynced_uploaded_documents(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Dokumen yang sudah ter-upload ke Drive tapi belum tersinkron ke
+    Sheets (termasuk sisa dari percobaan sync sebelumnya yang gagal
+    di tengah jalan)."""
+    return conn.execute(
+        """
+        SELECT d.id AS document_id, d.file_name, d.status
+        FROM documents d
+        JOIN extracted_fields ef ON ef.document_id = d.id
+        WHERE d.status = 'uploaded_drive' AND (ef.synced IS NULL OR ef.synced = 0)
+        ORDER BY d.id
+        """
+    ).fetchall()

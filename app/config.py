@@ -58,10 +58,47 @@ if EXTRACTION_MAX_PAGES == 0:
 _DEFAULT_DB_DIR = Path.home() / ".local" / "share" / "glm-ocr-app"
 DB_PATH = Path(os.environ.get("GLM_OCR_DB_PATH", str(_DEFAULT_DB_DIR / "app.db")))
 
-# --- Belum dipakai sampai Tahap 4 (Sheets & Drive) ---
+# --- Wajib untuk Tahap 3 (GUI) ---
+# Folder penyimpanan file PDF yang di-upload lewat GUI Streamlit. File di
+# sini bersifat SEMENTARA — akan dihapus otomatis setelah berhasil
+# di-upload ke Google Drive (Tahap 4), sesuai desain "sumber kebenaran
+# ada di Drive, tidak disimpan ganda secara lokal".
+PDF_STORAGE_DIR = Path(
+    os.environ.get("PDF_STORAGE_DIR", str(_DEFAULT_DB_DIR / "pdf_storage"))
+)
+
+
+def ensure_pdf_storage_dir() -> None:
+    PDF_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+# --- Wajib untuk Tahap 4 (sync Google Sheets & Drive) ---
 GOOGLE_APPLICATION_CREDENTIALS = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
 GOOGLE_DRIVE_FOLDER_ID = os.environ.get("GOOGLE_DRIVE_FOLDER_ID")
+
+
+def validate_google_config() -> None:
+    """Pastikan semua env var & file kredensial Google sudah tersedia
+    sebelum mencoba konek ke Sheets/Drive. Lempar ConfigError dengan
+    pesan jelas jika ada yang kurang, supaya gagal cepat & jelas
+    (bukan error mentah dari Google API di tengah proses)."""
+    missing = []
+    if not GOOGLE_APPLICATION_CREDENTIALS:
+        missing.append("GOOGLE_APPLICATION_CREDENTIALS")
+    elif not Path(GOOGLE_APPLICATION_CREDENTIALS).is_file():
+        raise ConfigError(
+            f"GOOGLE_APPLICATION_CREDENTIALS diset ke '{GOOGLE_APPLICATION_CREDENTIALS}' "
+            "tapi file tidak ditemukan di path tersebut."
+        )
+    if not GOOGLE_SHEET_ID:
+        missing.append("GOOGLE_SHEET_ID")
+    if not GOOGLE_DRIVE_FOLDER_ID:
+        missing.append("GOOGLE_DRIVE_FOLDER_ID")
+    if missing:
+        raise ConfigError(
+            "Environment variable berikut wajib diisi untuk sync Sheets/Drive: "
+            + ", ".join(missing)
+        )
 
 
 def ensure_db_dir() -> None:

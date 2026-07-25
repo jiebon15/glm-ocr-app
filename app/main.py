@@ -112,8 +112,14 @@ def process_pdf(pdf_path: Path, dpi: int) -> str:
             )
             delete_ocr_results(conn, document_id)
             reset_document_for_retry(conn, document_id)
+            conn.execute(
+                "UPDATE documents SET local_path = ? WHERE id = ?",
+                (str(pdf_path.resolve()), document_id),
+            )
         else:
-            document_id = insert_document(conn, pdf_path.name, file_hash)
+            document_id = insert_document(
+                conn, pdf_path.name, file_hash, local_path=str(pdf_path.resolve())
+            )
 
     logger.info("Mulai proses: %s (document_id=%s)", pdf_path.name, document_id)
 
